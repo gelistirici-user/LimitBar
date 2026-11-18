@@ -8,6 +8,8 @@
 
 - 🟢 Tepsi ikonu en yüksek kullanım yüzdenizi gösterir: yeşil (< %70), sarı (%70–90), kırmızı (≥ %90)
 - 🖱️ Sol tık: her servis için 5 saatlik / haftalık / model bazlı limitler, ilerleme çubukları ve sıfırlanma zamanları
+- 🔔 Bir limit **%95'e** ulaşınca Windows bildirimi gösterir (her limit dönemi için bir kez)
+- 💰 Claude Code ve Codex için bugün / 7 gün / 30 günlük **token kullanımı** ve bunun **API fiyatıyla tahmini maliyeti**
 - 🔄 5 dakikada bir otomatik yenilenir; sağ tık menüsünden elle de yenilenebilir
 - 🪶 **Ek kurulum gerekmez:** Windows'ta hazır gelen PowerShell 5.1 ve .NET Framework ile çalışır
 - 🔒 Tokenlarınız sadece ilgili servisin kendi sunucusuna gönderilir (Anthropic, OpenAI, Google)
@@ -20,7 +22,7 @@ macOS için yazılmış [CodexBar](https://github.com/steipete/CodexBar) uygulam
 
 | Servis | Gösterilen limitler | Gereken |
 |---|---|---|
-| **Claude Code** | 5 saatlik, haftalık, haftalık Opus / Sonnet, ek kullanım | Claude Pro / Max / Team / Enterprise aboneliğiyle `claude` CLI'a giriş yapılmış olması |
+| **Claude Code** | 5 saatlik, haftalık, model bazlı haftalık limitler (ör. **Fable**), ek kullanım | Claude Pro / Max / Team / Enterprise aboneliğiyle `claude` CLI'a giriş yapılmış olması |
 | **Codex** | 5 saatlik ve/veya haftalık, modele özel limitler, kredi bakiyesi | ChatGPT hesabıyla Codex'e (CLI veya masaüstü uygulaması) giriş yapılmış olması |
 | **Gemini CLI** | Günlük Pro / Flash / Flash-Lite kotası | Google hesabıyla `gemini` CLI'a giriş yapılmış olması (bkz. [Gemini notu](#gemini-notu)) |
 
@@ -77,18 +79,32 @@ Uygulamayı kapatır, `%LOCALAPPDATA%\LimitBar` klasörünü ve kısayolları si
 | İkonun **üzerine gelmek** | Her servisin en yüksek kullanımını kısaca gösterir |
 | **Sağ tık → Şimdi yenile** | Limitleri hemen yeniden çeker |
 | **Sağ tık → Windows ile başlat** | Başlangıçta açılmayı açar / kapatır |
+| **Sağ tık → Limit %95 olunca bildir** | Bildirimleri açar / kapatır |
 | **Sağ tık → Çıkış** | Uygulamayı kapatır |
+
+### Bildirimler
+
+Herhangi bir limit (5 saatlik, haftalık, model bazlı…) **%95'e** ulaştığında Windows bildirimi gelir. Aynı limit dönemi için yalnızca bir kez bildirilir; limit sıfırlanıp tekrar %95'i geçerse yeniden bildirilir. Eşiği değiştirmek için `%LOCALAPPDATA%\LimitBar\settings.json` dosyasındaki `"threshold"` değerini düzenleyip uygulamayı yeniden başlatın.
+
+### Token kullanımı ve tahmini maliyet
+
+Panelde Claude Code ve Codex için **bugün, son 7 gün ve son 30 gün** harcanan token miktarı ile bunun **API fiyatlarıyla ne kadar tutacağı** gösterilir; altında 30 günlük maliyetin modellere göre dağılımı yer alır.
+
+- Veriler CLI araçlarının bilgisayarınızdaki oturum kayıtlarından okunur (`%USERPROFILE%\.claude\projects\**\*.jsonl`, `%USERPROFILE%\.codex\sessions\**\*.jsonl`). **Hiçbir yere gönderilmez.**
+- Kayıtlar ilk açılışta bir kez taranır (birkaç GB'lık kayıt için birkaç saniye), sonraki yenilemelerde yalnızca yeni eklenen satırlar okunur.
+- Token toplamına önbellekten okunan (cache read) ve önbelleğe yazılan tokenlar da dahildir; maliyet her türü kendi fiyatıyla hesaplar.
+- **Bu bir tahmindir ve faturanız değildir.** Abonelikle (Pro / Max / Team / Plus…) kullandığınızda bu tutarı ödemezsiniz; aynı kullanımın API ile kaç dolara geleceğini gösterir. Fiyatlar 2026 Kasım itibarıyla Anthropic ve OpenAI'ın standart API fiyatlarıdır (uzun bağlam, batch ve hızlı mod indirim/ek ücretleri hesaba katılmaz).
 
 ### Komut satırı seçenekleri
 
 ```powershell
-# Limitleri bir kez çekip JSON olarak yazdırır (betiklerde kullanmak için)
+# Limitleri ve token kullanımını bir kez çekip JSON olarak yazdırır (betiklerde kullanmak için)
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\LimitBar\LimitBar.ps1" -Once
 ```
 
 | Parametre | Açıklama |
 |---|---|
-| `-Once` | Arayüz açmadan limitleri JSON olarak yazdırır |
+| `-Once` | Arayüz açmadan limitleri (`Limits`) ve token kullanımını (`Usage`) JSON olarak yazdırır |
 | `-NoRefresh` | Süresi dolmuş tokenları yenilemez; kimlik dosyalarına hiç yazmaz |
 | `-Demo` | Gerçek hesaplar yerine örnek verilerle çalışır |
 | `-Screenshot yol.png` | Paneli PNG olarak kaydedip çıkar |

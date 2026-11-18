@@ -8,13 +8,15 @@
 
 - 🟢 The tray icon shows your highest usage percentage: green (< 70%), amber (70–90%), red (≥ 90%)
 - 🖱️ Left-click: 5-hour / weekly / per-model limits for each service, with progress bars and reset times
+- 🔔 Windows notification when any limit reaches **95%** (once per limit period)
+- 💰 **Token usage** for Claude Code and Codex (today / 7 days / 30 days) and its **estimated cost at API prices**
 - 🔄 Refreshes every 5 minutes, or on demand from the right-click menu
 - 🪶 **Nothing to install:** runs on the PowerShell 5.1 and .NET Framework that ship with Windows
 - 🔒 Your tokens are only sent to each provider's own servers (Anthropic, OpenAI, Google)
 
 Inspired by [CodexBar](https://github.com/steipete/CodexBar) for macOS.
 
-> The UI is currently in Turkish. "kullanıldı" = used, "Sıfırlanma" = resets, "5 saatlik" = 5-hour, "Haftalık" = weekly, "Günlük" = daily.
+> The UI is currently in Turkish. "kullanıldı" = used, "Sıfırlanma" = resets, "5 saatlik" = 5-hour, "Haftalık" = weekly, "Günlük" = daily, "Bugün" = today, "Son 7 gün" = last 7 days, "tahmini maliyet" = estimated cost, "M" = million, "Mr" = billion.
 
 <br clear="right">
 
@@ -22,7 +24,7 @@ Inspired by [CodexBar](https://github.com/steipete/CodexBar) for macOS.
 
 | Service | Limits shown | Requirement |
 |---|---|---|
-| **Claude Code** | 5-hour, weekly, weekly Opus / Sonnet, extra usage | Signed in to the `claude` CLI with a Pro / Max / Team / Enterprise plan |
+| **Claude Code** | 5-hour, weekly, per-model weekly limits (e.g. **Fable**), extra usage | Signed in to the `claude` CLI with a Pro / Max / Team / Enterprise plan |
 | **Codex** | 5-hour and/or weekly, per-model limits, credit balance | Signed in to Codex (CLI or desktop app) with a ChatGPT account |
 | **Gemini CLI** | Daily Pro / Flash / Flash-Lite quota | Signed in to the `gemini` CLI with Google (see [Gemini note](#gemini-note)) |
 
@@ -63,11 +65,24 @@ irm https://raw.githubusercontent.com/gelistirici-user/LimitBar/main/uninstall.p
 
 This removes the app folder and shortcuts. Your Claude / Codex / Gemini sessions are not touched.
 
+## Notifications
+
+When any limit (5-hour, weekly, per-model…) reaches **95%**, you get a Windows notification, once per limit period; it re-arms after the limit resets. Toggle it from the right-click menu (**Limit %95 olunca bildir**), or change `"threshold"` in `%LOCALAPPDATA%\LimitBar\settings.json` and restart the app.
+
+## Token usage and estimated cost
+
+For Claude Code and Codex, the panel shows tokens spent **today, in the last 7 days and in the last 30 days**, what that would cost **at API prices**, and the 30-day cost split by model.
+
+- Read from the CLIs' local session logs (`%USERPROFILE%\.claude\projects\**\*.jsonl`, `%USERPROFILE%\.codex\sessions\**\*.jsonl`). **Nothing is sent anywhere.**
+- Logs are scanned once at startup (a few seconds for several GB), then only newly appended lines are read.
+- Token totals include cache reads and cache writes; the cost prices each kind at its own rate.
+- **This is an estimate, not your bill.** On a subscription (Pro / Max / Team / Plus…) you don't pay this amount; it shows what the same usage would cost via the API, using Anthropic's and OpenAI's standard API prices as of November 2026 (long-context, batch and fast-mode pricing is not modelled).
+
 ## Command-line options
 
 | Parameter | Description |
 |---|---|
-| `-Once` | Print limits as JSON without opening the UI |
+| `-Once` | Print limits (`Limits`) and token usage (`Usage`) as JSON without opening the UI |
 | `-NoRefresh` | Never refresh expired tokens; never write to credential files |
 | `-Demo` | Use sample data instead of real accounts |
 | `-Screenshot path.png` | Render the panel to a PNG and exit |

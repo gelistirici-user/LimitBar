@@ -6,7 +6,7 @@
 
   Kullanım:
     LimitBar.ps1                 Tepsi uygulamasını başlatır
-    LimitBar.ps1 -Once           Limitleri bir kez çekip konsola JSON yazar
+    LimitBar.ps1 -Once           Limitleri ve token kullanımını bir kez çekip konsola JSON yazar
     LimitBar.ps1 -NoRefresh      Süresi dolmuş tokenları yenilemez (kimlik dosyalarına yazmaz)
     LimitBar.ps1 -Demo           Gerçek hesaplar yerine örnek verilerle çalışır
     LimitBar.ps1 -Screenshot x.png   Paneli bir kez çizip PNG olarak kaydeder ve çıkar
@@ -19,7 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$LBVersion = '1.0.0'
+$LBVersion = '1.1.0'
 $RepoUrl = 'https://github.com/gelistirici-user/LimitBar'
 
 # ---------------------------------------------------------------------------
@@ -155,16 +155,37 @@ $FetchScript = {
         'User-Agent'     = 'claude-code/2.1.0'
       }
       $u = Invoke-Api 'GET' 'https://api.anthropic.com/api/oauth/usage' $hdr
-      $map = @(
-        @('five_hour', '5 saatlik'),
-        @('seven_day', 'Haftalık'),
-        @('seven_day_opus', 'Haftalık · Opus'),
-        @('seven_day_sonnet', 'Haftalık · Sonnet')
-      )
-      foreach ($k in $map) {
-        $w = $u.($k[0])
-        if ($w -and $null -ne $w.utilization) {
-          $r.Windows += New-Window $k[1] $w.utilization (FromIso $w.resets_at)
+      $limits = @($u.limits | Where-Object { $_ -and $null -ne $_.percent })
+      if ($limits.Count) {
+        # Yeni biçim: model bazlı (ör. Fable) haftalık limitler dahil hepsi bu listede
+        foreach ($l in $limits) {
+          switch ([string]$l.kind) {
+            'session'    { $label = '5 saatlik' }
+            'weekly_all' { $label = 'Haftalık' }
+            default {
+              $label = switch ([string]$l.group) { 'session' { '5 saatlik' } 'weekly' { 'Haftalık' } default { [string]$l.kind } }
+            }
+          }
+          $scopeName = $null
+          if ($l.scope) {
+            if ($l.scope.model) { $scopeName = if ($l.scope.model.display_name) { $l.scope.model.display_name } else { $l.scope.model.id } }
+            if (-not $scopeName -and $l.scope.surface) { $scopeName = [string]$l.scope.surface }
+          }
+          if ($scopeName) { $label = "$label · $scopeName" }
+          $r.Windows += New-Window $label $l.percent (FromIso $l.resets_at)
+        }
+      } else {
+        $map = @(
+          @('five_hour', '5 saatlik'),
+          @('seven_day', 'Haftalık'),
+          @('seven_day_opus', 'Haftalık · Opus'),
+          @('seven_day_sonnet', 'Haftalık · Sonnet')
+        )
+        foreach ($k in $map) {
+          $w = $u.($k[0])
+          if ($w -and $null -ne $w.utilization) {
+            $r.Windows += New-Window $k[1] $w.utilization (FromIso $w.resets_at)
+          }
         }
       }
       if ($u.extra_usage -and $u.extra_usage.is_enabled -and $null -ne $u.extra_usage.utilization) {
@@ -365,7 +386,7 @@ if ($Demo) {
       [pscustomobject]@{ Name = 'Claude'; Plan = 'Max'; Error = $null; Note = $null; Windows = @(
         (W '5 saatlik' 42 $now.AddHours(2).AddMinutes(13)),
         (W 'Haftalık' 71 $now.AddDays(3).AddHours(5)),
-        (W 'Haftalık · Opus' 18 $now.AddDays(3).AddHours(5))) }
+        (W 'Haftalık · Fable' 58 $now.AddDays(3).AddHours(5))) }
       [pscustomobject]@{ Name = 'Codex'; Plan = 'Pro'; Error = $null; Note = $null; Windows = @(
         (W '5 saatlik' 12 $now.AddHours(4).AddMinutes(40)),
         (W 'Haftalık' 93 $now.AddDays(1).AddHours(7))) }
@@ -376,8 +397,278 @@ if ($Demo) {
   }
 }
 
+# ---------------------------------------------------------------------------
+#  Token kullanımı ve tahmini API maliyeti (yerel oturum kayıtlarından)
+#  Claude Code: ~/.claude/projects/**/*.jsonl  ·  Codex: ~/.codex/sessions/**/*.jsonl
+#  Dosyalar bir kez okunur; sonraki yenilemelerde yalnızca eklenen satırlar taranır.
+# ---------------------------------------------------------------------------
+$UsageCs = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+
+public static class LBUsage {
+  public class Agg {
+    public string Provider; public string Day; public string Model;
+    public long Input; public long Output; public long CacheRead; public long CacheWrite; public double Cost;
+  }
+  class FileState {
+    public long Offset;
+    public Dictionary<string, Agg> Aggs = new Dictionary<string, Agg>();
+    public string Model; public long PIn, PCached, POut;
+  }
+  static readonly Dictionary<string, FileState> Files = new Dictionary<string, FileState>(StringComparer.OrdinalIgnoreCase);
+  static readonly HashSet<ulong> Seen = new HashSet<ulong>();
+  static readonly object Gate = new object();
+
+  static readonly byte[] PUsageObj = Encoding.ASCII.GetBytes("\"usage\":{");
+  static readonly byte[] PMessageObj = Encoding.ASCII.GetBytes("\"message\":{");
+  static readonly byte[] PTokenCount = Encoding.ASCII.GetBytes("\"token_count\"");
+  static readonly byte[] PTurnCtx = Encoding.ASCII.GetBytes("\"turn_context\"");
+
+  static Regex R(string key) { return new Regex("\"" + key + "\":(\\d+)", RegexOptions.Compiled | RegexOptions.CultureInvariant); }
+  static readonly Regex RIn = R("input_tokens"), ROut = R("output_tokens"), RCr = R("cache_read_input_tokens"),
+    RCc = R("cache_creation_input_tokens"), R5m = R("ephemeral_5m_input_tokens"), R1h = R("ephemeral_1h_input_tokens"),
+    RCached = R("cached_input_tokens");
+  static readonly Regex RModel = new Regex("\"model\":\"([^\"]+)\"", RegexOptions.Compiled);
+  static readonly Regex RTs = new Regex("\"timestamp\":\"([^\"]+)\"", RegexOptions.Compiled | RegexOptions.RightToLeft);
+  static readonly Regex RTsFirst = new Regex("\"timestamp\":\"([^\"]+)\"", RegexOptions.Compiled);
+  static readonly Regex RMsgId = new Regex("\"id\":\"(msg_[^\"]+)\"", RegexOptions.Compiled);
+  static readonly Regex RReq = new Regex("\"requestId\":\"([^\"]+)\"", RegexOptions.Compiled);
+
+  // Milyon token başına USD: girdi, çıktı, önbellek yazma 5dk, önbellek yazma 1sa, önbellek okuma
+  static double[] P(double i, double o, double cr) { return new[] { i, o, i * 1.25, i * 2, cr }; }
+  public static double[] ClaudePrice(string m) {
+    m = m.ToLowerInvariant();
+    if (m.Contains("fable-5-2") || m.Contains("mythos-5-2")) return P(8, 40, 0.20);
+    if (m.Contains("fable-5-1") || m.Contains("mythos-5-1")) return P(10, 50, 0.25);
+    if (m.Contains("fable") || m.Contains("mythos")) return P(10, 50, 1.0);
+    if (m.Contains("opus-5-5")) return P(4, 20, 0.20);
+    if (m.Contains("opus-5") || m.Contains("opus-4-5") || m.Contains("opus-4-6") || m.Contains("opus-4-7") || m.Contains("opus-4-8")) return P(5, 25, 0.5);
+    if (m.Contains("opus")) return P(15, 75, 1.5);
+    if (m.Contains("sonnet-5-5")) return P(2, 10, 0.10);
+    if (m.Contains("sonnet-5")) return P(2, 10, 0.20);
+    if (m.Contains("sonnet")) return P(3, 15, 0.30);
+    if (m.Contains("haiku-5-5")) return P(0.10, 0.50, 0.01);
+    if (m.Contains("haiku")) return P(1, 5, 0.10);
+    return P(4, 20, 0.20);
+  }
+  // Milyon token başına USD: girdi, önbellekli girdi, çıktı
+  public static double[] GptPrice(string m) {
+    m = m.ToLowerInvariant();
+    if (m.Contains("luna")) return new[] { 0.10, 0.01, 0.50 };
+    if (m.Contains("6.2-astra")) return new[] { 8.0, 0.40, 40.0 };
+    if (m.Contains("astra")) return new[] { 10.0, 1.0, 50.0 };
+    if (m.Contains("terra")) return new[] { 1.0, 0.05, 5.0 };
+    if (m.Contains("gpt-6-sol")) return new[] { 2.0, 0.20, 10.0 };
+    return new[] { 2.0, 0.10, 10.0 };
+  }
+
+  static ulong Hash(string s) {
+    ulong h = 14695981039346656037UL;
+    foreach (char c in s) { h ^= c; h *= 1099511628211UL; }
+    return h;
+  }
+  static long Num(Regex r, string s, int start) {
+    var m = r.Match(s, start);
+    return m.Success ? long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
+  }
+  static string Day(string ts) {
+    DateTime d;
+    if (!DateTime.TryParse(ts, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d)) return null;
+    return d.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+  }
+  static void Add(FileState st, string prov, string day, string model, long i, long o, long cr, long cw, double cost) {
+    string k = prov + "|" + day + "|" + model;
+    Agg a;
+    if (!st.Aggs.TryGetValue(k, out a)) { a = new Agg { Provider = prov, Day = day, Model = model }; st.Aggs[k] = a; }
+    a.Input += i; a.Output += o; a.CacheRead += cr; a.CacheWrite += cw; a.Cost += cost;
+  }
+
+  // Satırın tamamını çözmek yerine (içinde dev dosya içerikleri olabilir) yalnızca
+  // "message" başını ve "usage" ile sonrasını metne çevirir.
+  static void ClaudeBytes(FileState st, byte[] a, int len) {
+    // Gerçek "usage" nesnesi mesajın sonundadır; araç girdilerindeki benzer anahtarlara takılmamak için sonuncuyu al
+    int ui = -1, k = 0;
+    while ((k = IndexOf(a, k, len, PUsageObj)) >= 0) { ui = k; k++; }
+    if (ui < 0) return;
+    int mi = IndexOf(a, 0, ui, PMessageObj); if (mi < 0) return;
+    string head = Encoding.UTF8.GetString(a, mi, Math.Min(600, ui - mi));
+    string tail = Encoding.UTF8.GetString(a, ui, Math.Min(len - ui, 16384));
+    string pre = null;
+    if (tail.IndexOf("\"type\":\"assistant\"", StringComparison.Ordinal) < 0) {
+      pre = Encoding.UTF8.GetString(a, 0, Math.Min(mi, 4096));
+      if (pre.IndexOf("\"type\":\"assistant\"", StringComparison.Ordinal) < 0) return;
+    }
+    var mm = RModel.Match(head); if (!mm.Success) return;
+    string model = mm.Groups[1].Value; if (model.StartsWith("<")) return;
+    var idm = RMsgId.Match(head); var rq = RReq.Match(tail);
+    if (idm.Success && !Seen.Add(Hash(idm.Groups[1].Value + ":" + (rq.Success ? rq.Groups[1].Value : "")))) return;
+    var tm = RTs.Match(tail);
+    if (!tm.Success) { if (pre == null) pre = Encoding.UTF8.GetString(a, 0, Math.Min(mi, 4096)); tm = RTs.Match(pre); }
+    if (!tm.Success) return;
+    string day = Day(tm.Groups[1].Value); if (day == null) return;
+    string s = tail; int ui0 = 0;
+    long inp = Num(RIn, s, ui0), outp = Num(ROut, s, ui0), cr = Num(RCr, s, ui0), cc = Num(RCc, s, ui0);
+    long w5 = Num(R5m, s, ui0), w1 = Num(R1h, s, ui0);
+    if (w5 + w1 == 0) w5 = cc;
+    var p = ClaudePrice(model);
+    double cost = (inp * p[0] + outp * p[1] + w5 * p[2] + w1 * p[3] + cr * p[4]) / 1e6;
+    Add(st, "claude", day, model, inp, outp, cr, w5 + w1, cost);
+  }
+
+  static void CodexLine(FileState st, string s) {
+    if (s.IndexOf("\"turn_context\"", StringComparison.Ordinal) >= 0) {
+      var m = RModel.Match(s); if (m.Success) st.Model = m.Groups[1].Value;
+      return;
+    }
+    if (s.IndexOf("\"token_count\"", StringComparison.Ordinal) < 0) return;
+    int ti = s.IndexOf("\"total_token_usage\":{", StringComparison.Ordinal); if (ti < 0) return;
+    long tin = Num(RIn, s, ti), tc = Num(RCached, s, ti), tout = Num(ROut, s, ti);
+    long din = tin - st.PIn, dc = tc - st.PCached, dout = tout - st.POut;
+    if (din < 0 || dc < 0 || dout < 0) { din = tin; dc = tc; dout = tout; }
+    st.PIn = tin; st.PCached = tc; st.POut = tout;
+    if (din == 0 && dout == 0) return;
+    var tm = RTsFirst.Match(s); if (!tm.Success) return;
+    string day = Day(tm.Groups[1].Value); if (day == null) return;
+    string model = st.Model ?? "gpt";
+    long fresh = Math.Max(0, din - dc);
+    var p = GptPrice(model);
+    double cost = (fresh * p[0] + dc * p[1] + dout * p[2]) / 1e6;
+    Add(st, "codex", day, model, fresh, dout, dc, 0, cost);
+  }
+
+  static int IndexOf(byte[] a, int start, int end, byte[] pat) {
+    int last = end - pat.Length;
+    int i = start;
+    while (i <= last) {
+      i = Array.IndexOf<byte>(a, pat[0], i, last - i + 1);
+      if (i < 0) return -1;
+      int j = 1; while (j < pat.Length && a[i + j] == pat[j]) j++;
+      if (j == pat.Length) return i;
+      i++;
+    }
+    return -1;
+  }
+  static bool Has(byte[] a, int len, byte[] pat) { return IndexOf(a, 0, len, pat) >= 0; }
+
+  static long ReadLines(string path, FileState st, long start, long end, bool claude) {
+    long lastComplete = start;
+    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1 << 16)) {
+      fs.Seek(start, SeekOrigin.Begin);
+      var buf = new byte[1 << 20];
+      var line = new MemoryStream();
+      long pos = start; int n;
+      while (pos < end && (n = fs.Read(buf, 0, (int)Math.Min(buf.Length, end - pos))) > 0) {
+        int s = 0;
+        for (int i = 0; i < n; i++) {
+          if (buf[i] != (byte)'\n') continue;
+          line.Write(buf, s, i - s);
+          byte[] arr = line.GetBuffer(); int len = (int)line.Length;
+          try {
+            if (claude) ClaudeBytes(st, arr, len);
+            else if (Has(arr, len, PTokenCount) || Has(arr, len, PTurnCtx)) CodexLine(st, Encoding.UTF8.GetString(arr, 0, len));
+          } catch { }
+          line.SetLength(0); s = i + 1; lastComplete = pos + i + 1;
+        }
+        line.Write(buf, s, n - s);
+        pos += n;
+      }
+    }
+    return lastComplete;
+  }
+
+  static void ScanFile(string path, bool claude, DateTime cutoffUtc) {
+    FileInfo fi;
+    try { fi = new FileInfo(path); if (!fi.Exists || fi.LastWriteTimeUtc < cutoffUtc) return; } catch { return; }
+    FileState st;
+    if (!Files.TryGetValue(path, out st)) { st = new FileState(); Files[path] = st; }
+    if (fi.Length < st.Offset) { st.Offset = 0; st.Aggs.Clear(); st.PIn = st.PCached = st.POut = 0; st.Model = null; }
+    if (fi.Length == st.Offset) return;
+    try { st.Offset = ReadLines(path, st, st.Offset, fi.Length, claude); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+  }
+
+  static void ScanRoot(string root, bool claude, DateTime cutoffUtc) {
+    if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) return;
+    IEnumerable<string> files;
+    try { files = Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories); } catch { return; }
+    try { foreach (var f in files) ScanFile(f, claude, cutoffUtc); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+  }
+
+  public static List<Agg> Scan(string[] claudeRoots, string[] codexRoots, int days) {
+    lock (Gate) {
+      var cutoff = DateTime.UtcNow.AddDays(-days);
+      if (claudeRoots != null) foreach (var r in claudeRoots) ScanRoot(r, true, cutoff);
+      if (codexRoots != null) foreach (var r in codexRoots) ScanRoot(r, false, cutoff);
+      var merged = new Dictionary<string, Agg>();
+      foreach (var st in Files.Values) {
+        foreach (var a in st.Aggs.Values) {
+          string k = a.Provider + "|" + a.Day + "|" + a.Model;
+          Agg m;
+          if (!merged.TryGetValue(k, out m)) { m = new Agg { Provider = a.Provider, Day = a.Day, Model = a.Model }; merged[k] = m; }
+          m.Input += a.Input; m.Output += a.Output; m.CacheRead += a.CacheRead; m.CacheWrite += a.CacheWrite; m.Cost += a.Cost;
+        }
+      }
+      return new List<Agg>(merged.Values);
+    }
+  }
+}
+'@
+
+$UsageScript = {
+  param([string]$Cs, [string[]]$ClaudeRoots, [string[]]$CodexRoots)
+  $ErrorActionPreference = 'Stop'
+  if (-not ('LBUsage' -as [type])) { Add-Type -TypeDefinition $Cs -Language CSharp }
+  $aggs = [LBUsage]::Scan($ClaudeRoots, $CodexRoots, 31)
+  $now = Get-Date
+  $d0 = $now.ToString('yyyy-MM-dd'); $d7 = $now.AddDays(-6).ToString('yyyy-MM-dd'); $d30 = $now.AddDays(-29).ToString('yyyy-MM-dd')
+  $out = [ordered]@{}
+  foreach ($prov in 'claude', 'codex') {
+    $s = [ordered]@{ TodayTokens = [long]0; TodayCost = 0.0; WeekTokens = [long]0; WeekCost = 0.0; MonthTokens = [long]0; MonthCost = 0.0 }
+    $models = @{}
+    $any = $false
+    foreach ($a in $aggs) {
+      if ($a.Provider -ne $prov -or [string]::CompareOrdinal($a.Day, $d30) -lt 0) { continue }
+      $any = $true
+      $t = $a.Input + $a.Output + $a.CacheRead + $a.CacheWrite
+      $s.MonthTokens += $t; $s.MonthCost += $a.Cost
+      if ([string]::CompareOrdinal($a.Day, $d7) -ge 0) { $s.WeekTokens += $t; $s.WeekCost += $a.Cost }
+      if ($a.Day -eq $d0) { $s.TodayTokens += $t; $s.TodayCost += $a.Cost }
+      $models[$a.Model] = [double]$models[$a.Model] + $a.Cost
+    }
+    if ($any) {
+      $s.TopModels = @($models.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 |
+        ForEach-Object { [pscustomobject]@{ Model = $_.Key; Cost = $_.Value } })
+      $out[$prov] = [pscustomobject]$s
+    }
+  }
+  [pscustomobject]$out
+}
+
+$claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$ClaudeRoots = [string[]]@(Join-Path $claudeHome 'projects')
+$CodexRoots = [string[]]@((Join-Path $codexHome 'sessions'), (Join-Path $codexHome 'archived_sessions'))
+
+if ($Demo) {
+  $UsageScript = {
+    param([string]$Cs, [string[]]$ClaudeRoots, [string[]]$CodexRoots)
+    [pscustomobject]@{
+      claude = [pscustomobject]@{ TodayTokens = 18400000; TodayCost = 21.37; WeekTokens = 142000000; WeekCost = 168.90; MonthTokens = 512000000; MonthCost = 604.15
+        TopModels = @([pscustomobject]@{ Model = 'claude-fable-5-2'; Cost = 480.2 }, [pscustomobject]@{ Model = 'claude-opus-5-5'; Cost = 110.4 }) }
+      codex  = [pscustomobject]@{ TodayTokens = 2300000; TodayCost = 1.12; WeekTokens = 19600000; WeekCost = 9.85; MonthTokens = 61000000; MonthCost = 31.40
+        TopModels = @([pscustomobject]@{ Model = 'gpt-6.1-sol'; Cost = 27.9 }) }
+    }
+  }
+}
+
 if ($Once) {
-  & $FetchScript ([bool]$NoRefresh) | ConvertTo-Json -Depth 6
+  $limits = @(& $FetchScript ([bool]$NoRefresh))
+  $usage = & $UsageScript $UsageCs $ClaudeRoots $CodexRoots
+  [pscustomobject]@{ Limits = $limits; Usage = $usage } | ConvertTo-Json -Depth 6
   return
 }
 
@@ -445,11 +736,79 @@ function Format-Reset($dt) {
 }
 
 $script:Results = @()
+$script:Usage = $null
+$script:UsageError = $null
 $script:Loading = $false
 $script:LastUpdate = $null
-$script:Job = $null
+$script:Jobs = @{ limits = $null; usage = $null }
 $script:IconHandle = [IntPtr]::Zero
 $script:LastHide = [datetime]::MinValue
+
+# ------------------------------- Ayarlar --------------------------------
+# %LOCALAPPDATA%\LimitBar\settings.json  ->  { "notify": true, "threshold": 95, "notified": { ... } }
+$SettingsPath = Join-Path $env:LOCALAPPDATA 'LimitBar\settings.json'
+$script:Settings = [pscustomobject]@{ notify = $true; threshold = 95 }
+$script:Notified = @{}
+try {
+  if (Test-Path -LiteralPath $SettingsPath) {
+    $s = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -ne $s.notify) { $script:Settings.notify = [bool]$s.notify }
+    if ($s.threshold -and [double]$s.threshold -gt 0) { $script:Settings.threshold = [double]$s.threshold }
+    if ($s.notified) { foreach ($p in $s.notified.PSObject.Properties) { $script:Notified[$p.Name] = [string]$p.Value } }
+  }
+} catch {}
+
+function Save-Settings {
+  if ($Screenshot -or $Demo) { return }
+  try {
+    $dir = Split-Path $SettingsPath
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    $o = [ordered]@{ notify = $script:Settings.notify; threshold = $script:Settings.threshold; notified = $script:Notified }
+    [IO.File]::WriteAllText($SettingsPath, ($o | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+  } catch {}
+}
+
+function Format-Tokens([double]$n) {
+  if ($n -ge 1e9) { return ($n / 1e9).ToString('0.##', $TR) + ' Mr' }
+  if ($n -ge 1e6) { return ($n / 1e6).ToString('0.#', $TR) + ' M' }
+  if ($n -ge 1e3) { return ($n / 1e3).ToString('0.#', $TR) + ' B' }
+  [string][long]$n
+}
+function Format-Usd([double]$v) {
+  if ($v -ge 100) { return '$' + $v.ToString('N0', $TR) }
+  '$' + $v.ToString('N2', $TR)
+}
+
+# Bir limit eşiği (varsayılan %95) aştığında Windows bildirimi gösterir.
+# Aynı limit dönemi için bir kez bildirir; limit sıfırlanınca tekrar kurulur.
+function Test-Notifications {
+  if (-not $script:Settings.notify -or $Screenshot) { return }
+  $th = [double]$script:Settings.threshold
+  $msgs = @()
+  $changed = $false
+  foreach ($r in $script:Results) {
+    foreach ($w in $r.Windows) {
+      $key = "$($r.Name)|$($w.Label)"
+      $stamp = if ($w.ResetAt) { $w.ResetAt.ToString('yyyy-MM-dd HH') } else { 'x' }
+      if ($w.Used -ge $th) {
+        if ($script:Notified[$key] -ne $stamp) {
+          $script:Notified[$key] = $stamp; $changed = $true
+          $line = '{0} · {1}: %{2} kullanıldı' -f $r.Name, $w.Label, [math]::Round($w.Used)
+          $rs = Format-Reset $w.ResetAt
+          if ($rs) { $line += "`n" + $rs }
+          $msgs += $line
+        }
+      } elseif ($script:Notified.ContainsKey($key)) {
+        $script:Notified.Remove($key); $changed = $true
+      }
+    }
+  }
+  if ($changed) { Save-Settings }
+  if ($msgs.Count) {
+    $title = if ($msgs.Count -eq 1) { "Limit %$th seviyesine ulaştı" } else { "$($msgs.Count) limit %$th seviyesine ulaştı" }
+    $Tray.ShowBalloonTip(15000, $title, ($msgs -join "`n"), [Windows.Forms.ToolTipIcon]::Warning)
+  }
+}
 
 # ----------------------------- Panel (popup) --------------------------------
 $script:Popup = New-Object Windows.Forms.Form
@@ -557,6 +916,35 @@ function Build-Popup {
       $l = Add-Label $r.Note $pad $y $F.Small $C.Sub $w
       $y += $l.PreferredSize.Height + (S 6)
     }
+    $u = $null
+    if ($script:Usage) { $u = $script:Usage.($r.Name.ToLower()) }
+    if ($u) {
+      $y += S 2
+      [void](Add-Label 'Token kullanımı · API fiyatıyla tahmini maliyet' $pad $y $F.Small $C.Sub)
+      $y += S 19
+      foreach ($row in @(
+          @('Bugün', $u.TodayTokens, $u.TodayCost),
+          @('Son 7 gün', $u.WeekTokens, $u.WeekCost),
+          @('Son 30 gün', $u.MonthTokens, $u.MonthCost))) {
+        [void](Add-Label ('{0} · {1} token' -f $row[0], (Format-Tokens $row[1])) $pad $y $F.Small $C.Text)
+        [void](Add-RightLabel ('≈ ' + (Format-Usd $row[2])) $right $y $F.Small $C.Text)
+        $y += S 18
+      }
+      $top = @($u.TopModels | Where-Object { $_ -and $_.Cost -gt 0 })
+      if ($top.Count -and $u.MonthCost -gt 0) {
+        $parts = $top | ForEach-Object { '{0} %{1}' -f ($_.Model -replace '^claude-', ''), [math]::Round(100 * $_.Cost / $u.MonthCost) }
+        $l = Add-Label ('30 günlük maliyetin dağılımı: ' + ($parts -join ' · ')) $pad $y $F.Small $C.Sub $w
+        $y += $l.PreferredSize.Height + (S 4)
+      }
+      $y += S 6
+    } elseif ($script:Jobs.usage -and $r.Name -in 'Claude', 'Codex') {
+      [void](Add-Label 'Token kullanımı hesaplanıyor…' $pad $y $F.Small $C.Sub)
+      $y += S 24
+    }
+  }
+  if ($script:UsageError) {
+    $l = Add-Label ('Token kullanımı okunamadı: ' + $script:UsageError) $pad $y $F.Small $C.Amber $w
+    $y += $l.PreferredSize.Height + (S 8)
   }
 
   Add-Separator $pad $y $w
@@ -627,15 +1015,29 @@ function Update-UI {
 }
 
 # ---------------------------- Arka plan yenileme ----------------------------
-$script:Runspace = [runspacefactory]::CreateRunspace()
-$Runspace.Open()
+# Limitler ve token taraması ayrı runspace'lerde çalışır; uzun bir ilk tarama limitleri bekletmez.
+$script:Runspaces = @{}
+foreach ($k in 'limits', 'usage') {
+  $rs = [runspacefactory]::CreateRunspace()
+  $rs.Open()
+  $script:Runspaces[$k] = $rs
+}
+
+function Start-Work($kind) {
+  if ($script:Jobs[$kind]) { return }
+  $ps = [PowerShell]::Create()
+  $ps.Runspace = $script:Runspaces[$kind]
+  if ($kind -eq 'limits') {
+    [void]$ps.AddScript($FetchScript.ToString()).AddArgument([bool]$NoRefresh)
+  } else {
+    [void]$ps.AddScript($UsageScript.ToString()).AddArgument($UsageCs).AddArgument($ClaudeRoots).AddArgument($CodexRoots)
+  }
+  $script:Jobs[$kind] = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+}
 
 function Start-Refresh {
-  if ($script:Job) { return }
-  $ps = [PowerShell]::Create()
-  $ps.Runspace = $script:Runspace
-  [void]$ps.AddScript($FetchScript.ToString()).AddArgument([bool]$NoRefresh)
-  $script:Job = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+  Start-Work 'limits'
+  Start-Work 'usage'
   $script:Loading = $true
   Update-UI
 }
@@ -643,20 +1045,38 @@ function Start-Refresh {
 $script:Poll = New-Object Windows.Forms.Timer
 $Poll.Interval = 400
 $Poll.Add_Tick({
-  if (-not $script:Job -or -not $script:Job.Handle.IsCompleted) { return }
-  try {
-    $out = $script:Job.PS.EndInvoke($script:Job.Handle)
-    $script:Results = @($out | Where-Object { $_ })
-  } catch {
-    $script:Results = @([pscustomobject]@{ Name = 'LimitBar'; Plan = $null; Windows = @(); Error = $_.Exception.Message; Note = $null })
-  } finally {
-    $script:Job.PS.Dispose()
-    $script:Job = $null
-    $script:Loading = $false
-    $script:LastUpdate = Get-Date
+  $changed = $false
+  foreach ($kind in 'limits', 'usage') {
+    $j = $script:Jobs[$kind]
+    if (-not $j -or -not $j.Handle.IsCompleted) { continue }
+    try {
+      $out = $j.PS.EndInvoke($j.Handle)
+      if ($kind -eq 'limits') {
+        $script:Results = @($out | Where-Object { $_ })
+      } else {
+        $script:Usage = @($out | Where-Object { $_ }) | Select-Object -First 1
+        $script:UsageError = $null
+      }
+    } catch {
+      if ($kind -eq 'limits') {
+        $script:Results = @([pscustomobject]@{ Name = 'LimitBar'; Plan = $null; Windows = @(); Error = $_.Exception.Message; Note = $null })
+      } else {
+        $script:UsageError = $_.Exception.Message
+      }
+    } finally {
+      $j.PS.Dispose()
+      $script:Jobs[$kind] = $null
+    }
+    $changed = $true
+    if ($kind -eq 'limits') {
+      $script:Loading = $false
+      $script:LastUpdate = Get-Date
+      Test-Notifications
+    }
   }
+  if (-not $changed) { return }
   Update-UI
-  if ($Screenshot) {
+  if ($Screenshot -and -not $script:Jobs.limits -and -not $script:Jobs.usage) {
     Build-Popup
     $Popup.Location = New-Object Drawing.Point(-4000, -4000)
     $Popup.Show()
@@ -706,6 +1126,15 @@ $miAuto.Add_Click({
   catch { [Windows.Forms.MessageBox]::Show("Başlangıç kısayolu ayarlanamadı: $($_.Exception.Message)", 'LimitBar') | Out-Null }
 })
 [void]$menu.Items.Add($miAuto)
+$miNotify = New-Object Windows.Forms.ToolStripMenuItem("Limit %$($script:Settings.threshold) olunca bildir")
+$miNotify.Checked = [bool]$script:Settings.notify
+$miNotify.Add_Click({
+  $script:Settings.notify = -not $script:Settings.notify
+  $miNotify.Checked = [bool]$script:Settings.notify
+  Save-Settings
+  if ($script:Settings.notify) { Test-Notifications }
+})
+[void]$menu.Items.Add($miNotify)
 $miRepo = $menu.Items.Add("GitHub sayfası (v$LBVersion)")
 $miRepo.Add_Click({ Start-Process $RepoUrl })
 [void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
@@ -732,5 +1161,5 @@ Start-Refresh
 $Tray.Visible = $false
 $Tray.Dispose()
 if ($script:IconHandle -ne [IntPtr]::Zero) { [void][LBNative]::DestroyIcon($script:IconHandle) }
-$Runspace.Close()
+foreach ($rs in $script:Runspaces.Values) { try { $rs.Close() } catch {} }
 try { $script:Mutex.ReleaseMutex() } catch {}
