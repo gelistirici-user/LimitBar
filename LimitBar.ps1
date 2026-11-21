@@ -19,7 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$LBVersion = '1.1.0'
+$LBVersion = '1.2.0'
 $RepoUrl = 'https://github.com/gelistirici-user/LimitBar'
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ $FetchScript = {
   $H = $env:USERPROFILE
 
   function New-Result($name) {
-    [pscustomobject]@{ Name = $name; Plan = $null; Windows = @(); Error = $null; Note = $null }
+    [pscustomobject]@{ Name = $name; Plan = $null; Windows = @(); Error = $null; Note = $null; Detail = $null; Usage = $null }
   }
   function New-Window($label, $used, $resetAt, $secs = 0) {
     [pscustomobject]@{ Label = $label; Used = [double]$used; ResetAt = $resetAt; Secs = $secs }
@@ -374,7 +374,96 @@ $FetchScript = {
     $r
   }
 
-  @(Get-Claude; Get-Codex; Get-Gemini) | Where-Object { $_ }
+  # ---------------------------- Gemini Omni (API) ----------------------------
+  # Gemini API anahtarıyla yapılan Omni video istekleri için Google kalan kota bilgisi vermez.
+  # Bu yüzden kullanım, video üreten betiğin yazdığı yerel kayıttan okunur:
+  #   %LOCALAPPDATA%\LimitBar\omni-usage.jsonl  (her satır: ts, model, status, http, usage)
+  # Günlük istek limiti isteğe bağlıdır: settings.json -> "omniDailyLimit": 20
+  function Get-Omni {
+    $key = $env:GEMINI_API_KEY
+    if (-not $key) { $key = [Environment]::GetEnvironmentVariable('GEMINI_API_KEY', 'User') }
+    $log = Join-Path $env:LOCALAPPDATA 'LimitBar\omni-usage.jsonl'
+    if (-not $key -and -not (Test-Path -LiteralPath $log)) { return $null }
+    $r = New-Result 'Omni'
+    $r.Plan = 'Gemini API'
+    try {
+      $entries = @()
+      if (Test-Path -LiteralPath $log) {
+        foreach ($line in [IO.File]::ReadAllLines($log)) {
+          if (-not $line.Trim()) { continue }
+          try { $entries += ($line | ConvertFrom-Json) } catch {}
+        }
+      }
+
+      # Google'ın günlük istek kotası Pasifik saatiyle gece yarısı sıfırlanır
+      $tz = [TimeZoneInfo]::FindSystemTimeZoneById('Pacific Standard Time')
+      $pNow = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
+      $dayStartUtc = [TimeZoneInfo]::ConvertTimeToUtc($pNow.Date, $tz)
+      $nextReset = [TimeZoneInfo]::ConvertTimeToUtc($pNow.Date.AddDays(1), $tz).ToLocalTime()
+
+      $now = Get-Date
+      $d0 = $now.Date; $d7 = $now.Date.AddDays(-6); $d30 = $now.Date.AddDays(-29)
+      $u = [ordered]@{ TodayTokens = [long]0; TodayCost = 0.0; TodayCount = 0; WeekTokens = [long]0; WeekCost = 0.0; WeekCount = 0
+                       MonthTokens = [long]0; MonthCost = 0.0; MonthCount = 0; TopModels = @(); Unit = 'video'; Billed = $true }
+      $quotaToday = 0; $requestsToday = 0; $last429 = $null; $lastModel = $null
+      foreach ($e in $entries) {
+        $tsUtc = $null
+        try { $tsUtc = [DateTimeOffset]::Parse([string]$e.ts, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } catch { continue }
+        $local = $tsUtc.ToLocalTime()
+        if ($tsUtc -ge $dayStartUtc) {
+          $requestsToday++
+          if ([int]$e.http -eq 429) { $quotaToday++; $last429 = $local }
+        }
+        if ($e.model) { $lastModel = [string]$e.model }
+        if ($e.status -ne 'completed' -or -not $e.usage) { continue }
+        $inT = [long]$e.usage.total_input_tokens; if (-not $inT) { $inT = [long]$e.usage.input_tokens }
+        $outT = [long]$e.usage.total_output_tokens; if (-not $outT) { $outT = [long]$e.usage.output_tokens }
+        $cost = ($inT * 1.50 + $outT * 17.50) / 1e6   # Omni Flash: $1,50 girdi / $17,50 video çıktısı (1M token)
+        $tok = $inT + $outT
+        if ($local -ge $d30) { $u.MonthTokens += $tok; $u.MonthCost += $cost; $u.MonthCount++ }
+        if ($local -ge $d7) { $u.WeekTokens += $tok; $u.WeekCost += $cost; $u.WeekCount++ }
+        if ($local -ge $d0) { $u.TodayTokens += $tok; $u.TodayCost += $cost; $u.TodayCount++ }
+      }
+      $r.Usage = [pscustomobject]$u
+
+      $limit = $null
+      $sp = Join-Path $env:LOCALAPPDATA 'LimitBar\settings.json'
+      if (Test-Path -LiteralPath $sp) {
+        try { $st = Read-Json $sp; if ($st.omniDailyLimit -and [double]$st.omniDailyLimit -gt 0) { $limit = [double]$st.omniDailyLimit } } catch {}
+      }
+      if ($limit) {
+        # Etiket sabit kalmalı: bildirimler limitleri etiketlerine göre takip eder
+        $r.Windows += New-Window 'Günlük istek' ([math]::Min(100, 100 * $requestsToday / $limit)) $nextReset
+      }
+
+      # $notes: her zaman görünen uyarılar  ·  $details: açılır bölümdeki bilgi satırları
+      $notes = @(); $details = @()
+      if ($quotaToday) { $notes += "Bugün $quotaToday kez kota hatası (429) alındı, son: $($last429.ToString('HH:mm')). Günlük limit dolmuş olabilir; sıfırlanma $($nextReset.ToString('HH:mm'))." }
+      if ($limit) { $details += "Bugün $requestsToday / $limit istek" }
+      else { $details += "Bugün $requestsToday istek. Google kalan kotayı göstermiyor; günlük limitini settings.json'a ""omniDailyLimit"" olarak yazarsan çubuk görünür." }
+
+      if ($key) {
+        try {
+          $m = if ($lastModel) { $lastModel } else { 'gemini-omni-1.2-flash' }
+          $mi = Invoke-Api 'GET' "https://generativelanguage.googleapis.com/v1beta/models/$m" @{ 'x-goog-api-key' = $key; Accept = 'application/json' }
+          $details = @("API anahtarı geçerli · $($mi.displayName)") + $details
+        } catch {
+          $st = $_.Exception.Data['Status']
+          if ($st -eq 400 -or $st -eq 401 -or $st -eq 403) { $r.Error = "GEMINI_API_KEY geçersiz veya yetkisiz ($st)." }
+          elseif ($st -eq 404) { $notes += "Model bulunamadı: $m" }
+          else { $notes += "Anahtar kontrol edilemedi: $($_.Exception.Message)" }
+        }
+      } else {
+        $notes += 'GEMINI_API_KEY tanımlı değil; yalnızca yerel kayıt gösteriliyor.'
+      }
+      if ($u.MonthCount -eq 0 -and $entries.Count -eq 0) { $details += 'Henüz kayıtlı Omni isteği yok.' }
+      if ($notes.Count) { $r.Note = $notes -join "`n" }
+      if ($details.Count) { $r.Detail = $details -join "`n" }
+    } catch { $r.Error = Get-ErrorText $_ 'GEMINI_API_KEY ortam değişkenini kontrol edin.' }
+    $r
+  }
+
+  @(Get-Claude; Get-Codex; Get-Gemini; Get-Omni) | Where-Object { $_ }
 }
 
 if ($Demo) {
@@ -393,6 +482,10 @@ if ($Demo) {
       [pscustomobject]@{ Name = 'Gemini'; Plan = 'Standard'; Error = $null; Note = $null; Windows = @(
         (W 'Günlük · Pro' 30 $now.Date.AddDays(1)),
         (W 'Günlük · Flash' 5 $now.Date.AddDays(1))) }
+      [pscustomobject]@{ Name = 'Omni'; Plan = 'Gemini API'; Error = $null; Note = $null; Detail = "API anahtarı geçerli · Gemini Omni 1.2 Flash`nBugün 6 / 20 istek"; Windows = @(
+        (W 'Günlük istek' 30 $now.Date.AddDays(1).AddHours(10)))
+        Usage = [pscustomobject]@{ TodayTokens = 361000; TodayCost = 6.30; TodayCount = 6; WeekTokens = 1450000; WeekCost = 25.20; WeekCount = 24
+          MonthTokens = 3900000; MonthCost = 67.90; MonthCount = 65; TopModels = @(); Unit = 'video'; Billed = $true } }
     )
   }
 }
@@ -737,6 +830,10 @@ function Format-Reset($dt) {
 
 $script:Results = @()
 $script:Usage = $null
+$script:Expanded = @{}
+$script:RebuildTimer = New-Object Windows.Forms.Timer
+$RebuildTimer.Interval = 15
+$RebuildTimer.Add_Tick({ $script:RebuildTimer.Stop(); if ($Popup.Visible) { Build-Popup } })
 $script:UsageError = $null
 $script:Loading = $false
 $script:LastUpdate = $null
@@ -754,6 +851,7 @@ try {
     $s = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($null -ne $s.notify) { $script:Settings.notify = [bool]$s.notify }
     if ($s.threshold -and [double]$s.threshold -gt 0) { $script:Settings.threshold = [double]$s.threshold }
+    if ($s.omniDailyLimit) { $script:Settings | Add-Member -NotePropertyName omniDailyLimit -NotePropertyValue $s.omniDailyLimit -Force }
     if ($s.notified) { foreach ($p in $s.notified.PSObject.Properties) { $script:Notified[$p.Name] = [string]$p.Value } }
   }
 } catch {}
@@ -763,7 +861,9 @@ function Save-Settings {
   try {
     $dir = Split-Path $SettingsPath
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-    $o = [ordered]@{ notify = $script:Settings.notify; threshold = $script:Settings.threshold; notified = $script:Notified }
+    $o = [ordered]@{ notify = $script:Settings.notify; threshold = $script:Settings.threshold }
+    if ($script:Settings.omniDailyLimit) { $o.omniDailyLimit = $script:Settings.omniDailyLimit }
+    $o.notified = $script:Notified
     [IO.File]::WriteAllText($SettingsPath, ($o | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
   } catch {}
 }
@@ -918,15 +1018,40 @@ function Build-Popup {
     }
     $u = $null
     if ($script:Usage) { $u = $script:Usage.($r.Name.ToLower()) }
+    if (-not $u -and $r.Usage) { $u = $r.Usage }
+    $pending = $script:Jobs.usage -and $r.Name -in 'Claude', 'Codex'
+    if (-not ($u -or $r.Detail -or $pending)) { continue }
+
+    # Kullanım / maliyet / ayrıntılar: açılır-kapanır, uygulama her açıldığında kapalı başlar
+    $open = [bool]$script:Expanded[$r.Name]
+    $toggle = Add-Label $(if ($open) { '▾ Kullanım ve maliyeti gizle' } else { '▸ Kullanım ve maliyet' }) $pad $y $F.Small $C.Link
+    $toggle.Cursor = [Windows.Forms.Cursors]::Hand
+    $toggle.Tag = $r.Name
+    $toggle.Add_Click({
+      param($s, $e)
+      $n = [string]$s.Tag
+      $script:Expanded[$n] = -not [bool]$script:Expanded[$n]
+      # Tıklanan etiket yeniden çizimde silineceği için çizimi olay bittikten sonra yap
+      $script:RebuildTimer.Start()
+    })
+    $y += S 22
+    if (-not $open) { continue }
+
+    if ($r.Detail) {
+      $l = Add-Label $r.Detail $pad $y $F.Small $C.Sub $w
+      $y += $l.PreferredSize.Height + (S 6)
+    }
     if ($u) {
-      $y += S 2
-      [void](Add-Label 'Token kullanımı · API fiyatıyla tahmini maliyet' $pad $y $F.Small $C.Sub)
+      $caption = if ($u.Billed) { 'Kullanım · tahmini API faturası' } else { 'Token kullanımı · API fiyatıyla tahmini maliyet' }
+      [void](Add-Label $caption $pad $y $F.Small $C.Sub)
       $y += S 19
       foreach ($row in @(
-          @('Bugün', $u.TodayTokens, $u.TodayCost),
-          @('Son 7 gün', $u.WeekTokens, $u.WeekCost),
-          @('Son 30 gün', $u.MonthTokens, $u.MonthCost))) {
-        [void](Add-Label ('{0} · {1} token' -f $row[0], (Format-Tokens $row[1])) $pad $y $F.Small $C.Text)
+          @('Bugün', $u.TodayTokens, $u.TodayCost, $u.TodayCount),
+          @('Son 7 gün', $u.WeekTokens, $u.WeekCost, $u.WeekCount),
+          @('Son 30 gün', $u.MonthTokens, $u.MonthCost, $u.MonthCount))) {
+        $txt = if ($u.Unit) { '{0} · {1} {2} · {3} token' -f $row[0], $row[3], $u.Unit, (Format-Tokens $row[1]) }
+               else { '{0} · {1} token' -f $row[0], (Format-Tokens $row[1]) }
+        [void](Add-Label $txt $pad $y $F.Small $C.Text)
         [void](Add-RightLabel ('≈ ' + (Format-Usd $row[2])) $right $y $F.Small $C.Text)
         $y += S 18
       }
@@ -937,7 +1062,7 @@ function Build-Popup {
         $y += $l.PreferredSize.Height + (S 4)
       }
       $y += S 6
-    } elseif ($script:Jobs.usage -and $r.Name -in 'Claude', 'Codex') {
+    } elseif ($pending) {
       [void](Add-Label 'Token kullanımı hesaplanıyor…' $pad $y $F.Small $C.Sub)
       $y += S 24
     }
@@ -1080,6 +1205,19 @@ $Poll.Add_Tick({
     Build-Popup
     $Popup.Location = New-Object Drawing.Point(-4000, -4000)
     $Popup.Show()
+    # Test kancası: LIMITBAR_TEST_TOGGLE=Claude,Codex -> bu servislerin açılır bölümüne tıkla
+    if ($env:LIMITBAR_TEST_TOGGLE) {
+      $onClick = [Windows.Forms.Control].GetMethod('OnClick', [Reflection.BindingFlags]'Instance,NonPublic')
+      foreach ($n in $env:LIMITBAR_TEST_TOGGLE.Split(',')) {
+        $ctl = @($Popup.Controls | Where-Object { $_ -is [Windows.Forms.Label] -and [string]$_.Tag -eq $n }) | Select-Object -First 1
+        if ($ctl) {
+          [void]$onClick.Invoke($ctl, @([EventArgs]::Empty))
+          $until = (Get-Date).AddMilliseconds(300)
+          while ((Get-Date) -lt $until) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 20 }
+        } else { [Console]::Error.WriteLine("test toggle not found: $n") }
+      }
+      $Popup.Location = New-Object Drawing.Point(-4000, -4000)
+    }
     $bmp = New-Object Drawing.Bitmap $Popup.Width, $Popup.Height
     $Popup.DrawToBitmap($bmp, (New-Object Drawing.Rectangle(0, 0, $Popup.Width, $Popup.Height)))
     $bmp.Save($Screenshot, [Drawing.Imaging.ImageFormat]::Png)

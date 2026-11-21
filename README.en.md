@@ -27,6 +27,7 @@ Inspired by [CodexBar](https://github.com/steipete/CodexBar) for macOS.
 | **Claude Code** | 5-hour, weekly, per-model weekly limits (e.g. **Fable**), extra usage | Signed in to the `claude` CLI with a Pro / Max / Team / Enterprise plan |
 | **Codex** | 5-hour and/or weekly, per-model limits, credit balance | Signed in to Codex (CLI or desktop app) with a ChatGPT account |
 | **Gemini CLI** | Daily Pro / Flash / Flash-Lite quota | Signed in to the `gemini` CLI with Google (see [Gemini note](#gemini-note)) |
+| **Gemini Omni (API)** | Video count, tokens, estimated bill, optional daily request limit, quota-error warning | `GEMINI_API_KEY` set and your video script writing a usage log (see [Gemini Omni](#gemini-omni-api)) |
 
 Services you are not signed in to are simply hidden.
 
@@ -71,12 +72,39 @@ When any limit (5-hour, weekly, per-model…) reaches **95%**, you get a Windows
 
 ## Token usage and estimated cost
 
+Click **▸ Kullanım ve maliyet** (usage and cost) under a service to expand these details; they start collapsed each time the app starts.
+
 For Claude Code and Codex, the panel shows tokens spent **today, in the last 7 days and in the last 30 days**, what that would cost **at API prices**, and the 30-day cost split by model.
 
 - Read from the CLIs' local session logs (`%USERPROFILE%\.claude\projects\**\*.jsonl`, `%USERPROFILE%\.codex\sessions\**\*.jsonl`). **Nothing is sent anywhere.**
 - Logs are scanned once at startup (a few seconds for several GB), then only newly appended lines are read.
 - Token totals include cache reads and cache writes; the cost prices each kind at its own rate.
 - **This is an estimate, not your bill.** On a subscription (Pro / Max / Team / Plus…) you don't pay this amount; it shows what the same usage would cost via the API, using Anthropic's and OpenAI's standard API prices as of November 2026 (long-context, batch and fast-mode pricing is not modelled).
+
+## Gemini Omni (API)
+
+Google does **not expose remaining quota** for Omni video requests made with a Gemini API key. LimitBar therefore reads Omni usage from a local log written by your video script, and checks that `GEMINI_API_KEY` is valid with a free request.
+
+After each request, append one JSON line to `%LOCALAPPDATA%\LimitBar\omni-usage.jsonl`:
+
+```powershell
+function Write-LimitBarLog($entry) {
+    try {
+        $dir = Join-Path $env:LOCALAPPDATA 'LimitBar'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [IO.File]::AppendAllText((Join-Path $dir 'omni-usage.jsonl'), (($entry | ConvertTo-Json -Compress -Depth 6) + "`n"), (New-Object Text.UTF8Encoding $false))
+    } catch {}
+}
+# after a successful request ($resp = Interactions API response):
+Write-LimitBarLog ([ordered]@{ ts = (Get-Date).ToUniversalTime().ToString('o'); model = $Model; status = $resp.status; http = 200; usage = $resp.usage })
+# on failure:
+Write-LimitBarLog ([ordered]@{ ts = (Get-Date).ToUniversalTime().ToString('o'); model = $Model; status = 'error'; http = 429 })
+```
+
+The panel then shows:
+- **Videos**, tokens and **estimated bill** for today / 7 days / 30 days. Omni Flash is priced at $1.50 per 1M input tokens and $17.50 per 1M video output tokens, about $0.10 per second of 720p.
+- A warning if a **429 (quota) error** happened today. Google's daily quota resets at midnight Pacific time.
+- **Optional daily request bar:** put your daily request limit from Google AI Studio into `%LOCALAPPDATA%\LimitBar\settings.json` as `"omniDailyLimit": 20` to get a "Günlük istek" (daily requests) bar and the 95% notification.
 
 ## Command-line options
 

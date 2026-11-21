@@ -25,6 +25,7 @@ macOS için yazılmış [CodexBar](https://github.com/steipete/CodexBar) uygulam
 | **Claude Code** | 5 saatlik, haftalık, model bazlı haftalık limitler (ör. **Fable**), ek kullanım | Claude Pro / Max / Team / Enterprise aboneliğiyle `claude` CLI'a giriş yapılmış olması |
 | **Codex** | 5 saatlik ve/veya haftalık, modele özel limitler, kredi bakiyesi | ChatGPT hesabıyla Codex'e (CLI veya masaüstü uygulaması) giriş yapılmış olması |
 | **Gemini CLI** | Günlük Pro / Flash / Flash-Lite kotası | Google hesabıyla `gemini` CLI'a giriş yapılmış olması (bkz. [Gemini notu](#gemini-notu)) |
+| **Gemini Omni (API)** | Video sayısı, token, tahmini fatura, isteğe bağlı günlük istek limiti, kota hatası uyarısı | `GEMINI_API_KEY` ortam değişkeni ve video üreten betiğin kayıt yazması (bkz. [Gemini Omni](#gemini-omni-api)) |
 
 Giriş yapılmamış servisler panelde hiç görünmez.
 
@@ -76,6 +77,7 @@ Uygulamayı kapatır, `%LOCALAPPDATA%\LimitBar` klasörünü ve kısayolları si
 | İşlem | Sonuç |
 |---|---|
 | İkona **sol tık** | Limit panelini açar / kapatır |
+| Paneldeki **▸ Kullanım ve maliyet** | O servisin token / maliyet ayrıntılarını açar / kapatır (uygulama her açıldığında kapalı başlar) |
 | İkonun **üzerine gelmek** | Her servisin en yüksek kullanımını kısaca gösterir |
 | **Sağ tık → Şimdi yenile** | Limitleri hemen yeniden çeker |
 | **Sağ tık → Windows ile başlat** | Başlangıçta açılmayı açar / kapatır |
@@ -94,6 +96,31 @@ Panelde Claude Code ve Codex için **bugün, son 7 gün ve son 30 gün** harcana
 - Kayıtlar ilk açılışta bir kez taranır (birkaç GB'lık kayıt için birkaç saniye), sonraki yenilemelerde yalnızca yeni eklenen satırlar okunur.
 - Token toplamına önbellekten okunan (cache read) ve önbelleğe yazılan tokenlar da dahildir; maliyet her türü kendi fiyatıyla hesaplar.
 - **Bu bir tahmindir ve faturanız değildir.** Abonelikle (Pro / Max / Team / Plus…) kullandığınızda bu tutarı ödemezsiniz; aynı kullanımın API ile kaç dolara geleceğini gösterir. Fiyatlar 2026 Kasım itibarıyla Anthropic ve OpenAI'ın standart API fiyatlarıdır (uzun bağlam, batch ve hızlı mod indirim/ek ücretleri hesaba katılmaz).
+
+### Gemini Omni (API)
+
+Google, Gemini API anahtarıyla yapılan Omni video isteklerinde **kalan kotayı göstermiyor**. Bu yüzden LimitBar Omni kullanımını, video üreten betiğinizin yazdığı yerel bir kayıttan okur ve `GEMINI_API_KEY` anahtarınızın geçerli olduğunu ücretsiz bir istekle kontrol eder.
+
+Videoyu ürettiğiniz betikte, her istekten sonra `%LOCALAPPDATA%\LimitBar\omni-usage.jsonl` dosyasına bir satır ekleyin:
+
+```powershell
+function Write-LimitBarLog($entry) {
+    try {
+        $dir = Join-Path $env:LOCALAPPDATA 'LimitBar'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [IO.File]::AppendAllText((Join-Path $dir 'omni-usage.jsonl'), (($entry | ConvertTo-Json -Compress -Depth 6) + "`n"), (New-Object Text.UTF8Encoding $false))
+    } catch {}
+}
+# Başarılı istekten sonra ($resp = Interactions API yanıtı):
+Write-LimitBarLog ([ordered]@{ ts = (Get-Date).ToUniversalTime().ToString('o'); model = $Model; status = $resp.status; http = 200; usage = $resp.usage })
+# Hata olduğunda:
+Write-LimitBarLog ([ordered]@{ ts = (Get-Date).ToUniversalTime().ToString('o'); model = $Model; status = 'error'; http = 429 })
+```
+
+Panelde şunlar görünür:
+- Bugün / 7 gün / 30 gün üretilen **video sayısı**, token ve **tahmini fatura**. Fiyat: Omni Flash için milyon token başına girdi $1,50, video çıktısı $17,50; 720p'de saniye başına yaklaşık $0,10.
+- Bugün **429 (kota) hatası** alındıysa bir uyarı. Google'ın günlük kotası Pasifik saatiyle gece yarısı (Türkiye saatiyle 11:00) sıfırlanır.
+- **Günlük istek çubuğu (isteğe bağlı):** Google AI Studio'da gördüğünüz günlük istek limitinizi `%LOCALAPPDATA%\LimitBar\settings.json` dosyasına `"omniDailyLimit": 20` şeklinde yazarsanız, "Günlük istek" çubuğu ve %95 bildirimi de çalışır.
 
 ### Komut satırı seçenekleri
 
